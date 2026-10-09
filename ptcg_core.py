@@ -71,12 +71,24 @@ def parse_deck(text: str) -> dict:
 # ---------------------------------------------------------------------------
 # バトルログのターン分割
 # ---------------------------------------------------------------------------
-# 英語版:  "Turn # 3 - PlayerName's Turn"
-# 日本語版を想定した表記ゆれにも対応: "ターン # 3 - ○○のターン" など
-_TURN_HEADER = re.compile(
+# 実際のPTCGLログ:          "S_Tobari's Turn"（番号なし）
+# 旧形式・表記ゆれにも対応:  "Turn # 3 - PlayerName's Turn" / "○○のターン"
+_TURN_HEADER_NUMBERED = re.compile(
     r"^\s*(?:Turn|ターン)\s*#?\s*(\d+)\s*[-–—:：]\s*(.+?)\s*(?:'s Turn|’s Turn|のターン)?\s*$",
     re.I,
 )
+_TURN_HEADER_PLAIN = re.compile(r"^\s*(\S+?)\s*(?:'s Turn|’s Turn|のターン)\s*$", re.I)
+
+
+def _match_turn_header(line: str):
+    """ターン見出しなら (番号 or None, プレイヤー名) を返す。"""
+    m = _TURN_HEADER_NUMBERED.match(line)
+    if m:
+        return int(m.group(1)), m.group(2).strip()
+    m = _TURN_HEADER_PLAIN.match(line)
+    if m:
+        return None, m.group(1).strip()
+    return None
 
 
 class LogTurn(BaseModel):
@@ -103,9 +115,10 @@ def parse_log(text: str) -> ParsedLog:
         line = raw.rstrip()
         if not line.strip():
             continue
-        m = _TURN_HEADER.match(line)
-        if m:
-            turns.append(LogTurn(number=int(m.group(1)), player=m.group(2).strip(), lines=[]))
+        header = _match_turn_header(line)
+        if header:
+            num, player = header
+            turns.append(LogTurn(number=num if num is not None else len(turns) + 1, player=player, lines=[]))
             continue
         if turns:
             turns[-1].lines.append(line.strip())
@@ -237,10 +250,20 @@ class AIError(Exception):
     pass
 
 
+_CLIENTS: dict = {}
+
+
 def _client(api_key: str):
+    """Geminiクライアントを使い回す。
+
+    使い捨てにすると、通信中にクライアントが自動で閉じられて
+    「Cannot send a request, as the client has been closed.」になるため、保持しておく。
+    """
     from google import genai  # 遅延インポート（テスト時に不要にするため）
 
-    return genai.Client(api_key=api_key)
+    if api_key not in _CLIENTS:
+        _CLIENTS[api_key] = genai.Client(api_key=api_key)
+    return _CLIENTS[api_key]
 
 
 def _wrap_error(e: Exception) -> AIError:

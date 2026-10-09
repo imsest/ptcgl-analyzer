@@ -44,6 +44,9 @@ if APP_PASSWORD and not st.session_state.get("authed"):
 if "store" not in st.session_state:
     st.session_state.store = core.load_store()
 store = st.session_state.store
+# クラウド版は再起動でデータが消えるため、Secrets にプレイヤー名があればそれを初期値にする
+if not store["settings"].get("player_name") and secret("PLAYER_NAME"):
+    store["settings"]["player_name"] = secret("PLAYER_NAME")
 
 
 def persist():
