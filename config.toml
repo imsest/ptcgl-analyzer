@@ -7,3 +7,7 @@ textColor = "#E9EDF6"
 
 [client]
 toolbarMode = "minimal"
+
+[server]
+# static フォルダの画像（ホーム画面アイコン）を公開する
+enableStaticServing = true

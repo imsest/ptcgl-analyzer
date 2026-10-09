@@ -14,7 +14,8 @@ import streamlit as st
 
 import ptcg_core as core
 
-st.set_page_config(page_title="PTCGL 対局検討", page_icon="🃏", layout="centered",
+_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "icon.png")
+st.set_page_config(page_title="PTCGL 対局検討", page_icon=_ICON if os.path.exists(_ICON) else "🃏", layout="centered",
                    initial_sidebar_state="collapsed")
 
 # ---------------------------------------------------------------------------
@@ -125,6 +126,7 @@ button:focus-visible, summary:focus-visible {{ outline: 2px solid {C['gold']} !i
 .record .flag + .chev {{ margin-left: .4rem; }}
 .record details[open] .chev {{ transform: rotate(180deg); }}
 .record .sum {{ margin: .3rem 0 0 2.7rem; font-size: .93rem; line-height: 1.6; }}
+.record .prize {{ display: block; color: {C['muted']}; font-size: .75rem; margin-top: .15rem; }}
 .record .body {{ margin: 0 0 .9rem 2.7rem; font-size: .9rem; }}
 .record .body p {{ margin: .45rem 0 0; line-height: 1.7; }}
 .record .k {{ display: block; color: {C['muted']}; font-size: .75rem; }}
@@ -157,6 +159,32 @@ button:focus-visible, summary:focus-visible {{ outline: 2px solid {C['gold']} !i
 E = html.escape
 
 
+def register_home_icon():
+    """iPhone の「ホーム画面に追加」で使うアイコンを、アプリの外枠のページに登録する。
+
+    static/apple-touch-icon.png を Streamlit の静的配信（/app/static/...）で公開し、その URL を
+    外枠の <head> に <link rel="apple-touch-icon"> として追加する。
+    """
+    import streamlit.components.v1 as components
+    components.html("""<script>
+(function () {
+  function add(doc, href) {
+    if (!doc || !doc.head || doc.querySelector('link[data-ptcgl-icon]')) return;
+    var l = doc.createElement('link'); l.rel = 'apple-touch-icon'; l.sizes = '180x180'; l.href = href;
+    l.setAttribute('data-ptcgl-icon', '1'); doc.head.appendChild(l);
+    var t = doc.createElement('meta'); t.name = 'apple-mobile-web-app-title'; t.content = 'PTCGL検討';
+    doc.head.appendChild(t);
+  }
+  try {
+    var app = window.parent;
+    var href = new URL('app/static/apple-touch-icon.png', app.location.href).href;
+    add(app.document, href);
+    try { if (window.top !== app) add(window.top.document, href); } catch (e) {}
+  } catch (e) {}
+})();
+</script>""", height=0)
+
+
 # ---------------------------------------------------------------------------
 # 設定値（secrets.toml → 環境変数 → 画面入力 の順に探す）
 # ---------------------------------------------------------------------------
@@ -172,6 +200,8 @@ def secret(name: str, default: str = "") -> str:
 def brand(sub: str = ""):
     st.markdown(f'<div class="brand"><h1>PTCGL 対局検討</h1><span>{E(sub)}</span></div>', unsafe_allow_html=True)
 
+
+register_home_icon()  # ログイン画面でもアイコンが登録されるよう、最初に呼ぶ
 
 APP_PASSWORD = secret("APP_PASSWORD")
 if APP_PASSWORD and not st.session_state.get("authed"):
@@ -230,6 +260,28 @@ def run_ai(label: str, fn):
             s.update(label="うまくいきませんでした", state="error")
             st.error(str(e))
             return None
+
+
+def stream_answer(prompt: str, use_search: bool, label: str):
+    """回答を書けたところから順に表示する。完了したら回答(dict)を返す。"""
+    res: dict = {}
+    note = st.empty()
+    note.caption(label)
+    try:
+        st.write_stream(core.stream_text(api_key(), model(), prompt, store["regulation"], res,
+                                         use_search=use_search, notify=lambda m: note.caption(m)))
+    except core.AIError as e:
+        note.empty()
+        st.error(str(e))
+        return None
+    note.empty()
+    return res if res.get("text") else None
+
+
+def meta_is_fresh() -> bool:
+    """環境メモが7日以内に更新されていれば、毎回の検索を省いて速く答える。"""
+    a = core.meta_age_days(store)
+    return a is not None and a <= 7
 
 
 def show_answer(ans):
@@ -325,6 +377,10 @@ def render_analysis(rec: dict):
   <p>{E(a.get('overall_summary', ''))}</p>
 </div>""", unsafe_allow_html=True)
 
+    if rec.get("model") == "自動評価":
+        st.markdown('<div class="notice"><b>AIの検討を取得できなかったため、サイド差だけで形勢を表示しています。</b>'
+                    '少し時間をおいて「別の対局を検討する」から同じログで検討し直すと、AIの解説つきになります。</div>',
+                    unsafe_allow_html=True)
     if not turns:
         return
     ai_swings = {int(s["turn"]): s for s in a.get("swing_points", [])}
@@ -360,12 +416,11 @@ def render_analysis(rec: dict):
         if st.button(f"T{t} を深掘りする", key=f"dd_{rec['id']}_{t}", width="stretch"):
             if not need_key():
                 deck_text = store["decks"].get(rec.get("deck_name", ""), "")
-                ans = run_ai(f"ターン{t}を検討中…", lambda n: core.ask_text(
-                    api_key(), model(), core.deep_dive_prompt(a, t, rec["raw_log"], deck_text),
-                    store["regulation"], use_search=False, notify=n))
+                ans = stream_answer(core.deep_dive_prompt(a, t, rec["raw_log"], deck_text), False, f"ターン{t}を検討しています…")
                 if ans:
                     rec.setdefault("deep_dives", {})[str(t)] = ans
                     persist()
+                    st.rerun()
         dd = rec.get("deep_dives", {}).get(str(t))
         if dd:
             with st.expander(f"T{t} の深掘り", expanded=True):
@@ -380,10 +435,12 @@ def render_analysis(rec: dict):
         actions = " / ".join(E(x) for x in t.get("key_actions", []))
         better = f'<p class="better"><span class="k">より良い手</span>{E(t["better_play"])}</p>' if t.get("better_play") else ""
         flag = '<span class="flag">◆ 転換点</span>' if t["turn"] in swings else ""
+        pl = t.get("prizes_left")
+        prize = (f'<span class="prize">サイド残り 自分{pl[0]}・相手{pl[1]}</span>' if pl else "")
         rows.append(f"""<details><summary>
 <div class="row"><span class="n">T{t['turn']}</span><span class="who {who}">{E(t['player'])}</span>
 <span class="ev" style="color:{fg};background:{bg}">{E(core.eval_label(sc))}</span>{flag}<span class="chev">▾</span></div>
-<div class="sum">{E(t['summary'])}</div></summary>
+<div class="sum">{E(t['summary'])}{prize}</div></summary>
 <div class="body"><p><span class="k">評価の根拠</span>{E(t['reason'])}</p>
 {f'<p><span class="k">主な行動</span>{actions}</p>' if actions else ''}{better}</div></details>""")
     st.markdown(f'<div class="record">{"".join(rows)}</div>', unsafe_allow_html=True)
@@ -420,9 +477,12 @@ with tab_log:
             parsed = core.parse_log(raw_log)
             me = store["settings"].get("player_name", "")
             if parsed.ok:
-                info = f"{len(parsed.turns)}ターン読み取り（{' と '.join(parsed.players)}）"
+                fx = core.extract_facts(parsed, me)
+                last = fx["turns"][-1]
+                info = (f"{len(parsed.turns)}ターン読み取り：あなた（{fx['me']}）は{fx['went_first']}・{fx['result']}・"
+                        f"最終サイド残り 自分{last['my_left']}枚／相手{last['opp_left']}枚")
                 if me and me not in parsed.players:
-                    info += f"。設定のプレイヤー名「{me}」がログにありません"
+                    info += f"。設定のプレイヤー名「{me}」がログにないため、{fx['me']} を自分として扱います"
             else:
                 info = "ターンの区切りを読み取れませんでしたが、このまま検討できます"
             st.markdown(f'<p class="hint">{E(info)}</p>', unsafe_allow_html=True)
@@ -430,13 +490,23 @@ with tab_log:
         if st.button("この対局を検討する", type="primary", disabled=not raw_log.strip(), width="stretch"):
             if not need_key():
                 parsed = core.parse_log(raw_log)
-                prompt = core.build_analysis_prompt(core.format_log_for_ai(parsed, raw_log),
-                                                    store["settings"].get("player_name", ""),
-                                                    deck_text, store.get("meta_notes", ""), extra)
-                out = run_ai("1ターンずつ検討しています（30秒〜1分）",
-                             lambda n: core.analyze_game(api_key(), model(), prompt, store["regulation"], n))
+                facts = core.extract_facts(parsed, store["settings"].get("player_name", ""))
+                prompt = core.build_analysis_prompt(core.format_log_for_ai(parsed, raw_log), facts["me"],
+                                                    deck_text, store.get("meta_notes", ""), extra,
+                                                    digest=core.facts_digest(facts))
+                out = run_ai("1ターンずつ検討しています（20〜60秒）",
+                             lambda n: core.analyze_game(api_key(), model(), prompt, store["regulation"], n,
+                                                         fast=st.session_state.get("fast_mode", True)))
                 if out:
                     analysis, used = out
+                    analysis = core.merge_with_facts(analysis, facts)
+                elif facts["turns"]:
+                    # AIが使えなくても、サイドの取り合いだけで形勢は表示する
+                    analysis, used = core.fallback_analysis(facts), "自動評価"
+                    st.session_state.fallback_used = True
+                else:
+                    analysis = None
+                if analysis:
                     rec = core.new_analysis_record(deck_name, raw_log, extra, analysis, used)
                     store["analyses"].insert(0, rec)
                     persist()
@@ -523,12 +593,13 @@ with tab_deck:
         focus = st.text_input("特に知りたいこと（任意）", placeholder="後攻1ターン目の動き", key="guide_focus")
         if st.button("戦い方を解説してもらう", type="primary", width="stretch"):
             if not need_key():
-                ans = run_ai("最新の環境を調べながら解説しています", lambda n: core.ask_text(
-                    api_key(), model(), core.deck_guide_prompt(store["decks"][g_name], store.get("meta_notes", ""), focus),
-                    store["regulation"], use_search=True, notify=n))
+                search = not meta_is_fresh()
+                ans = stream_answer(core.deck_guide_prompt(store["decks"][g_name], store.get("meta_notes", ""), focus, search),
+                                    search, "最新の環境を検索してから書き始めます…" if search else "書き始めています…")
                 if ans:
                     store.setdefault("guides", {})[g_name] = ans
                     persist()
+                    st.rerun()
         show_answer(store.get("guides", {}).get(g_name))
 
 # --- 環境 ------------------------------------------------------------------
@@ -538,11 +609,10 @@ with tab_meta:
                     '更新すると、すべての検討とアドバイスに反映されます。</div>', unsafe_allow_html=True)
     if st.button("最新の環境を調べる", type="primary", width="stretch"):
         if not need_key():
-            ans = run_ai("大会結果を検索しています", lambda n: core.ask_text(
-                api_key(), model(), core.meta_research_prompt(store["regulation"]), store["regulation"],
-                use_search=True, notify=n))
+            ans = stream_answer(core.meta_research_prompt(store["regulation"]), True, "大会結果を検索しています…")
             if ans:
                 st.session_state.meta_draft = ans
+                st.rerun()
     draft = st.session_state.get("meta_draft")
     if draft:
         with st.container(border=True):
@@ -563,12 +633,13 @@ with tab_meta:
         m_name = st.selectbox("デッキ", names, key="meta_deck")
         if st.button("アドバイスをもらう", type="primary", width="stretch"):
             if not need_key():
-                ans = run_ai("最新の環境を調べながら考えています", lambda n: core.ask_text(
-                    api_key(), model(), core.meta_advice_prompt(store["decks"][m_name], store.get("meta_notes", "")),
-                    store["regulation"], use_search=True, notify=n))
+                search = not meta_is_fresh()
+                ans = stream_answer(core.meta_advice_prompt(store["decks"][m_name], store.get("meta_notes", ""), search),
+                                    search, "最新の環境を検索してから書き始めます…" if search else "書き始めています…")
                 if ans:
                     store.setdefault("meta_advice", {})[m_name] = ans
                     persist()
+                    st.rerun()
         show_answer(store.get("meta_advice", {}).get(m_name))
 
     st.markdown("### 保存している環境メモ")
@@ -602,7 +673,9 @@ with tab_set:
         st.text_input("Gemini APIキー", type="password", key="api_key_input",
                       help="Streamlit Cloud の Secrets に GEMINI_API_KEY を登録すると、毎回の入力が不要になります")
     st.selectbox("AIモデル", MODEL_CHOICES, key="model_sel",
-                 help="混雑や上限エラーのときは、自動で他のモデルに切り替えます")
+                 help="いちばん速いのは gemini-3.5-flash-lite。混雑や上限エラーのときは自動で切り替えます")
+    st.toggle("速さを優先する", value=True, key="fast_mode",
+              help="対局の検討で、AIが考える時間を短くします。じっくり検討させたいときはオフにしてください")
 
     st.markdown("### データ")
     st.markdown('<p class="hint">公開版はアプリの再起動でデータが消えることがあります。検討のあとにバックアップを保存してください。</p>',

@@ -159,6 +159,130 @@ def format_log_for_ai(parsed: ParsedLog, raw_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ログから確実に分かる事実を、AIに頼らずプログラムで抜き出す
+# （サイドの枚数・きぜつ・ワザ・使ったカード）
+# ---------------------------------------------------------------------------
+_RE_PRIZE = re.compile(r"^(\S+) took (a|\d+) Prize cards?", re.I)
+_RE_KO = re.compile(r"^(\S+?)'s (.+?) was Knocked Out!", re.I)
+_RE_ATTACK = re.compile(r"^(\S+?)'s (.+?) used (.+?) on (\S+?)[’']s (.+?) for (\d+) damage", re.I)
+_RE_ABILITY = re.compile(r"^(\S+?)'s (.+?) used ([^.]+)\.$", re.I)
+_RE_PLAYED = re.compile(r"^(\S+) played (.+?)(?: to the (?:Bench|Active Spot))?\.$", re.I)
+_RE_EVOLVED = re.compile(r"^(\S+) evolved (.+?) to (.+?) (?:on|in) the", re.I)
+_RE_FIRST = re.compile(r"^(\S+) decided to go (first|second)", re.I)
+_RE_WIN = re.compile(r"(\S+) wins\.", re.I)
+
+
+def baseline_score(my_left: int, opp_left: int) -> int:
+    """サイド残り枚数の差だけで出す、目安の形勢（-2〜+2）。"""
+    d = opp_left - my_left  # 相手の残りが多いほど自分が有利
+    return 2 if d >= 3 else 1 if d >= 1 else 0 if d == 0 else -1 if d >= -2 else -2
+
+
+def extract_facts(parsed: "ParsedLog", me: str) -> dict:
+    players = parsed.players
+    if me not in players:
+        me = players[1] if len(players) > 1 else (players[0] if players else me)
+    opp = next((p for p in players if p != me), "相手")
+    went_first = "不明"
+    for line in parsed.setup:
+        m = _RE_FIRST.match(line)
+        if m:
+            first = m.group(1) if m.group(2).lower() == "first" else (opp if m.group(1) == me else me)
+            went_first = "先攻" if first == me else "後攻"
+    result = "不明"
+    for line in parsed.ending:
+        m = _RE_WIN.search(line)
+        if m:
+            result = "勝ち" if m.group(1) == me else "負け"
+    left = {me: 6, opp: 6}
+    turns = []
+    for t in parsed.turns:
+        info = {"turn": t.number, "player": "自分" if t.player == me else "相手",
+                "attacks": [], "kos": [], "played": [], "evolved": [], "prizes": {me: 0, opp: 0}}
+        for line in t.lines:
+            if m := _RE_PRIZE.match(line):
+                n = 1 if m.group(2).lower() == "a" else int(m.group(2))
+                if m.group(1) in left:
+                    left[m.group(1)] -= n
+                    info["prizes"][m.group(1)] += n
+            elif m := _RE_KO.match(line):
+                info["kos"].append(("自分の" if m.group(1) == me else "相手の") + m.group(2))
+            elif m := _RE_ATTACK.match(line):
+                info["attacks"].append(f"{m.group(2)}の{m.group(3)} → {m.group(5)}に{m.group(6)}ダメージ")
+            elif m := _RE_EVOLVED.match(line):
+                info["evolved"].append(f"{m.group(2)}→{m.group(3)}")
+            elif m := _RE_PLAYED.match(line):
+                info["played"].append(m.group(2))
+        info["my_left"], info["opp_left"] = max(0, left[me]), max(0, left[opp])
+        info["baseline"] = baseline_score(info["my_left"], info["opp_left"])
+        turns.append(info)
+    return {"me": me, "opp": opp, "went_first": went_first, "result": result, "turns": turns}
+
+
+def facts_digest(f: dict) -> str:
+    """AIに渡す、ターンごとの事実のまとめ。"""
+    out = [f"自分＝{f['me']}／相手＝{f['opp']}／自分は{f['went_first']}／結果：{f['result']}"]
+    for t in f["turns"]:
+        out.append(f"[ターン{t['turn']}：{t['player']}] 終了時のサイド残り 自分{t['my_left']}枚・相手{t['opp_left']}枚")
+        if t["attacks"]:
+            out.append("  ワザ：" + "／".join(t["attacks"]))
+        if t["kos"]:
+            out.append("  きぜつ：" + "、".join(t["kos"]))
+        if t["evolved"]:
+            out.append("  進化：" + "、".join(t["evolved"]))
+        if t["played"]:
+            out.append("  使用・展開：" + "、".join(t["played"][:12]))
+    return "\n".join(out)
+
+
+def fallback_analysis(f: dict, note: str = "") -> dict:
+    """AIが使えないときに、サイド差だけで作る最低限の評価。"""
+    turns = []
+    for t in f["turns"]:
+        bits = t["attacks"][:1] + [f"{k}がきぜつ" for k in t["kos"]]
+        turns.append({
+            "turn": t["turn"], "player": t["player"],
+            "summary": "、".join(bits) if bits else ("展開・準備" if t["played"] or t["evolved"] else "大きな動きなし"),
+            "score": t["baseline"],
+            "reason": f"サイド残り 自分{t['my_left']}枚・相手{t['opp_left']}枚（サイド差による自動評価）",
+            "key_actions": (t["evolved"] + t["played"])[:4], "better_play": "",
+        })
+    return {
+        "my_name": f["me"], "opponent_name": f["opp"], "opponent_deck_guess": "不明",
+        "result": f["result"], "went_first": f["went_first"],
+        "overall_summary": note or "AIの検討を取得できなかったため、サイドの取り合いだけで形勢を表示しています。",
+        "turns": turns, "swing_points": [], "lessons": [],
+    }
+
+
+def merge_with_facts(analysis: dict, f: dict) -> dict:
+    """AIの結果を、プログラムで確認した事実で補正する（ターン抜け・勝敗・手番の誤りを直す）。"""
+    if f["result"] != "不明":
+        analysis["result"] = f["result"]
+    if f["went_first"] != "不明":
+        analysis["went_first"] = f["went_first"]
+    analysis["my_name"], analysis["opponent_name"] = f["me"], f["opp"]
+    by_turn = {int(t.get("turn", -1)): t for t in analysis.get("turns", [])}
+    fb = {t["turn"]: t for t in fallback_analysis(f)["turns"]}
+    merged = []
+    for t in f["turns"]:
+        n = t["turn"]
+        row = by_turn.get(n) or dict(fb[n])
+        row["turn"] = n
+        row["player"] = t["player"]  # 手番は事実で上書き
+        try:
+            row["score"] = max(-2, min(2, int(row.get("score", t["baseline"]))))
+        except (TypeError, ValueError):
+            row["score"] = t["baseline"]
+        row.setdefault("key_actions", [])
+        row.setdefault("better_play", "")
+        row["prizes_left"] = [t["my_left"], t["opp_left"]]
+        merged.append(row)
+    analysis["turns"] = merged if merged else analysis.get("turns", [])
+    return analysis
+
+
+# ---------------------------------------------------------------------------
 # AI の出力形式（構造化出力）
 # ---------------------------------------------------------------------------
 class TurnEval(BaseModel):
@@ -229,6 +353,11 @@ def system_prompt(regulation: str) -> str:
 - ローテーションで使用不可になったカードや、古い環境のデッキを前提にした助言はしないでください。
   カードが使用可能か自信がない場合は、そう明記してください。
 
+## PTCGL のログの癖
+- ダメカンを「のせかえる」特性などで、移した先のポケモンの持ち主名がログ上で誤って表示されることがある
+  （例：自分の特性で相手のポケモンに移したのに "自分's ポケモン" と書かれる）。文脈で判断すること。
+- "Pokémon Checkup" はターン終了時の処理（どく・やけどのダメージ）。
+
 ## 評価の観点
 - サイドの取り合い（残り枚数、次に何枚取れるか／取られるか、プライズマップ）
 - 盤面（育っているアタッカー、ベンチの耐久、ex の数）
@@ -248,14 +377,18 @@ def system_prompt(regulation: str) -> str:
 """
 
 
-def build_analysis_prompt(log_text: str, my_name: str, deck_text: str, meta_notes: str, extra_notes: str) -> str:
+def build_analysis_prompt(log_text: str, my_name: str, deck_text: str, meta_notes: str, extra_notes: str,
+                          digest: str = "") -> str:
     parts = [
+        f"## プログラムで確認した事実（サイド枚数・きぜつ・ワザ。これは正確なので必ず前提にする）\n{digest or '（なし）'}",
         f"## 自分のプレイヤー名\n{my_name or '（未設定：ログから推測して）'}",
         f"## 自分のデッキリスト\n{deck_text or '（未登録）'}",
         f"## 現在の環境メモ（最新情報。記憶より優先すること）\n{meta_notes or '（なし）'}",
         f"## ユーザーからの補足（手札の状況など）\n{extra_notes or '（なし）'}",
         f"## バトルログ\n{log_text}",
         "上のバトルログを解析し、指定のJSON形式で出力してください。"
+        "turns には、事実のまとめにある全ターン（同じターン番号）を1件ずつ、漏れなく入れてください。"
+        "score はサイド残りの差を土台に、盤面・手札・次の番の打点も加味して決めてください。"
         "「より良い手」「代替手順」で使うカードは、上のデッキリストかバトルログに出てくるカードだけにしてください。",
     ]
     return "\n\n".join(parts)
@@ -324,15 +457,16 @@ def _error_message(kind: str, raw: str) -> str:
     }.get(kind, f"AIの呼び出しに失敗しました：{raw[:300]}")
 
 
-def _generate(api_key: str, model: str, contents: str, config, notify: Optional[Callable[[str], None]] = None):
-    """混雑(503)は待って再試行、上限(429)やモデル不在は別モデルへ切り替える。"""
+def _with_fallback(model: str, call, notify: Optional[Callable[[str], None]] = None):
+    """混雑(503)は待って再試行、上限(429)やモデル不在は別モデルへ切り替えて call(model) を実行する。"""
     models = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_kind, last_raw = "other", ""
     for i, m in enumerate(models):
         for attempt in range(2):
             try:
-                resp = _client(api_key).models.generate_content(model=m, contents=contents, config=config)
-                return resp, m
+                return call(m), m
+            except AIError:
+                raise
             except Exception as e:  # noqa: BLE001
                 kind = _classify(e)
                 last_kind, last_raw = kind, str(e)
@@ -341,7 +475,7 @@ def _generate(api_key: str, model: str, contents: str, config, notify: Optional[
                 if kind == "busy" and attempt == 0:
                     if notify:
                         notify(f"{m} が混雑中。数秒待って再試行しています…")
-                    time.sleep(4)
+                    time.sleep(3)
                     continue
                 if kind == "other":
                     raise AIError(_error_message(kind, str(e))) from e
@@ -351,23 +485,75 @@ def _generate(api_key: str, model: str, contents: str, config, notify: Optional[
     raise AIError(_error_message(last_kind, last_raw))
 
 
-def analyze_game(api_key: str, model: str, prompt: str, regulation: str, notify=None) -> tuple[dict, str]:
+def _config(regulation: str, fast: bool, **kw):
+    """生成設定。fast=True なら AI の「考える時間」を短くして速く返させる。"""
     from google.genai import types
 
-    config = types.GenerateContentConfig(
-        system_instruction=system_prompt(regulation),
-        response_mime_type="application/json",
-        response_schema=GameAnalysis,
-        temperature=0.3,
-    )
-    resp, used = _generate(api_key, model, prompt, config, notify)
-    parsed = getattr(resp, "parsed", None)
-    if isinstance(parsed, GameAnalysis):
-        return parsed.model_dump(), used
+    if fast:
+        try:
+            kw["thinking_config"] = types.ThinkingConfig(thinking_level="low")
+        except Exception:  # noqa: BLE001  古いSDKなど、指定できない場合は既定のまま
+            pass
+    return types.GenerateContentConfig(system_instruction=system_prompt(regulation), **kw)
+
+
+def _strip_thinking(cfg):
     try:
-        return GameAnalysis.model_validate_json(resp.text).model_dump(), used
-    except Exception as e:  # noqa: BLE001
-        raise AIError("AIの返答を読み取れませんでした。もう一度試してください。") from e
+        return cfg.model_copy(update={"thinking_config": None})
+    except Exception:  # noqa: BLE001
+        return cfg
+
+
+def _run(api_key, model, contents, cfg, notify, stream=False):
+    """thinking 指定がモデルに拒否されたら、外してもう一度呼ぶ。"""
+    def call(m):
+        fn = _client(api_key).models.generate_content_stream if stream else _client(api_key).models.generate_content
+        try:
+            res = fn(model=m, contents=contents, config=cfg)
+            if stream:  # 最初のかたまりまで取ってから返す（エラーをここで捕まえるため）
+                it = iter(res)
+                first = next(it, None)
+                return first, it
+            return res
+        except Exception as e:  # noqa: BLE001
+            if "thinking" in str(e).lower() and getattr(cfg, "thinking_config", None) is not None:
+                res = fn(model=m, contents=contents, config=_strip_thinking(cfg))
+                if stream:
+                    it = iter(res)
+                    return next(it, None), it
+                return res
+            raise
+    return _with_fallback(model, call, notify)
+
+
+def analyze_game(api_key: str, model: str, prompt: str, regulation: str, notify=None, fast: bool = False) -> tuple[dict, str]:
+    def attempt(is_fast: bool):
+        cfg = _config(regulation, is_fast, response_mime_type="application/json", response_schema=GameAnalysis,
+                      temperature=0.3)
+        resp, used = _run(api_key, model, prompt, cfg, notify)
+        parsed = getattr(resp, "parsed", None)
+        if isinstance(parsed, GameAnalysis) and parsed.turns:
+            return parsed.model_dump(), used
+        text = (getattr(resp, "text", "") or "").strip()
+        m = re.search(r"\{.*\}", text, re.S)  # 前後に余計な文字が付いていても JSON 部分を拾う
+        data = GameAnalysis.model_validate_json(m.group(0) if m else text).model_dump()
+        if not data.get("turns"):
+            raise ValueError("turns が空")
+        return data, used
+
+    try:
+        return attempt(fast)
+    except AIError:
+        raise
+    except Exception:  # noqa: BLE001  返答が壊れていたら、じっくりモードでもう一度だけ
+        if notify:
+            notify("返答をうまく読み取れなかったので、もう一度検討しています…")
+        try:
+            return attempt(False)
+        except AIError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise AIError("AIの返答を読み取れませんでした。") from e
 
 
 def _sources(resp) -> list[dict]:
@@ -386,26 +572,56 @@ def _sources(resp) -> list[dict]:
     return out
 
 
-def ask_text(api_key: str, model: str, prompt: str, regulation: str, use_search: bool = True, notify=None) -> dict:
-    """自由形式（Markdown）の回答。use_search=True なら Google 検索で最新情報を確認させる。
+def stream_text(api_key: str, model: str, prompt: str, regulation: str, result: dict,
+                use_search: bool = True, notify=None):
+    """自由形式（Markdown）の回答を、書けた部分から順に返すジェネレーター。
 
-    返り値: {"text", "model", "searched", "sources", "at"}
+    終了後、result に {"text", "model", "searched", "sources", "at"} が入る。
     """
     from google.genai import types
 
-    base = dict(system_instruction=system_prompt(regulation), temperature=0.5)
+    base = dict(temperature=0.5)
+    pair, used, searched = None, model, False
     if use_search:
         try:
-            cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())], **base)
-            resp, used = _generate(api_key, model, prompt, cfg, notify)
-            return {"text": resp.text or "", "model": used, "searched": True,
-                    "sources": _sources(resp), "at": datetime.now().strftime("%Y-%m-%d %H:%M")}
+            cfg = _config(regulation, True, tools=[types.Tool(google_search=types.GoogleSearch())], **base)
+            pair, used = _run(api_key, model, prompt, cfg, notify, stream=True)
+            searched = True
         except AIError:
             if notify:
-                notify("検索つきで回答できなかったため、検索なしで回答します…")
-    resp, used = _generate(api_key, model, prompt, types.GenerateContentConfig(**base), notify)
-    return {"text": resp.text or "", "model": used, "searched": False,
-            "sources": [], "at": datetime.now().strftime("%Y-%m-%d %H:%M")}
+                notify("検索つきで回答できなかったため、保存した環境メモで回答します…")
+    if pair is None:
+        pair, used = _run(api_key, model, prompt, _config(regulation, True, **base), notify, stream=True)
+
+    first, rest = pair
+    parts, sources, seen = [], [], set()
+    def _consume(chunk):
+        for s in _sources(chunk):
+            if s["url"] not in seen:
+                seen.add(s["url"])
+                sources.append(s)
+        return getattr(chunk, "text", None) or ""
+
+    if first is not None:
+        t = _consume(first)
+        if t:
+            parts.append(t)
+            yield t
+    for chunk in rest:
+        t = _consume(chunk)
+        if t:
+            parts.append(t)
+            yield t
+    result.update({"text": "".join(parts), "model": used, "searched": searched, "sources": sources,
+                   "at": datetime.now().strftime("%Y-%m-%d %H:%M")})
+
+
+def ask_text(api_key: str, model: str, prompt: str, regulation: str, use_search: bool = True, notify=None) -> dict:
+    """ストリーミングせずに最後まで受け取る版（深掘りなど）。"""
+    result: dict = {}
+    for _ in stream_text(api_key, model, prompt, regulation, result, use_search, notify):
+        pass
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -415,16 +631,18 @@ _SEARCH_FIRST = (
     "まず Google 検索で、直近1か月のスタンダード環境（Limitless TCG の大会結果、"
     "公式の禁止・使用可能カード情報など）を確認してから答えてください。"
 )
+_USE_NOTES = "下の「環境メモ」は最近調べた最新情報です。これを今の環境として扱ってください。"
+_BRIEF = "各見出しは3〜6行の箇条書きで、要点だけを短く書いてください。前置きやまとめの挨拶は不要です。"
 
 
-def deck_guide_prompt(deck_text: str, meta_notes: str, focus: str) -> str:
-    return f"""{_SEARCH_FIRST}
-次のデッキの戦い方を、今の環境に合わせて解説してください。
+def deck_guide_prompt(deck_text: str, meta_notes: str, focus: str, search: bool = True) -> str:
+    return f"""{_SEARCH_FIRST if search else _USE_NOTES}
+次のデッキの戦い方を、今の環境に合わせて解説してください。{_BRIEF}
 
 ## デッキリスト
 {deck_text}
 
-## 環境メモ（ユーザーが保存した最新情報）
+## 環境メモ
 {meta_notes or '（なし）'}
 
 ## 特に知りたいこと
@@ -433,27 +651,27 @@ def deck_guide_prompt(deck_text: str, meta_notes: str, focus: str) -> str:
 以下の見出し（### を使う）で、カード名と順番を出して具体的に書いてください。
 ### コンセプトと勝ち筋
 ### 理想の展開（先攻1ターン目／後攻1ターン目／2ターン目以降）
-### 序盤の判断基準（手札・状況別）
+### 序盤の判断基準
 ### 中盤〜終盤のサイドプラン
-### 今の上位デッキとの相性と立ち回り
+### 今の上位デッキとの相性
 ### よくあるミス
 ### 構築の見直し候補（使用可能なカードのみ・理由つき）
 """
 
 
-def meta_advice_prompt(deck_text: str, meta_notes: str) -> str:
-    return f"""{_SEARCH_FIRST}
-自分のデッキへ、今の環境を踏まえたアドバイスをください。
+def meta_advice_prompt(deck_text: str, meta_notes: str, search: bool = True) -> str:
+    return f"""{_SEARCH_FIRST if search else _USE_NOTES}
+自分のデッキへ、今の環境を踏まえたアドバイスをください。{_BRIEF}
 
 ## 自分のデッキ
 {deck_text}
 
-## 環境メモ（ユーザーが保存した最新情報）
+## 環境メモ
 {meta_notes or '（なし）'}
 
 以下の見出し（### を使う）で：
 ### 今の環境での立ち位置（有利・不利な相手）
-### 不利な相手への対策（立ち回り・採用カード）
+### 不利な相手への対策
 ### 構築の調整案（IN / OUT を枚数つきで。使用可能なカードのみ）
 ### 練習で意識すること
 """
