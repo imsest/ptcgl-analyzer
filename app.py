@@ -14,8 +14,24 @@ import streamlit as st
 
 import ptcg_core as core
 
-_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "icon.png")
-st.set_page_config(page_title="PTCGL 対局検討", page_icon=_ICON if os.path.exists(_ICON) else "🃏", layout="centered",
+_STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+def _find_icon() -> str:
+    """static フォルダにある画像を1枚見つける（apple-touch-icon.png を優先、なければ他の画像）。"""
+    try:
+        files = sorted(os.listdir(_STATIC))
+    except OSError:
+        return ""
+    for name in ["apple-touch-icon.png", "icon.png"] + files:
+        if name in files and name.lower().endswith((".png", ".jpg", ".jpeg")):
+            return name
+    return ""
+
+
+_ICON_NAME = _find_icon()
+_ICON = os.path.join(_STATIC, _ICON_NAME) if _ICON_NAME else ""
+st.set_page_config(page_title="PTCGL 対局検討", page_icon=_ICON if _ICON else "🃏", layout="centered",
                    initial_sidebar_state="collapsed")
 
 # ---------------------------------------------------------------------------
@@ -159,30 +175,32 @@ button:focus-visible, summary:focus-visible {{ outline: 2px solid {C['gold']} !i
 E = html.escape
 
 
-def register_home_icon():
+def register_home_icon(name: str = ""):
     """iPhone の「ホーム画面に追加」で使うアイコンを、アプリの外枠のページに登録する。
 
     static/apple-touch-icon.png を Streamlit の静的配信（/app/static/...）で公開し、その URL を
     外枠の <head> に <link rel="apple-touch-icon"> として追加する。
     """
+    if not name:
+        return
     import streamlit.components.v1 as components
     components.html("""<script>
 (function () {
   function add(doc, href) {
     if (!doc || !doc.head || doc.querySelector('link[data-ptcgl-icon]')) return;
-    var l = doc.createElement('link'); l.rel = 'apple-touch-icon'; l.sizes = '180x180'; l.href = href;
+    var l = doc.createElement('link'); l.rel = 'apple-touch-icon'; l.href = href;
     l.setAttribute('data-ptcgl-icon', '1'); doc.head.appendChild(l);
     var t = doc.createElement('meta'); t.name = 'apple-mobile-web-app-title'; t.content = 'PTCGL検討';
     doc.head.appendChild(t);
   }
   try {
     var app = window.parent;
-    var href = new URL('app/static/apple-touch-icon.png', app.location.href).href;
+    var href = new URL('app/static/' + encodeURIComponent(__ICON__), app.location.href).href;
     add(app.document, href);
     try { if (window.top !== app) add(window.top.document, href); } catch (e) {}
   } catch (e) {}
 })();
-</script>""", height=0)
+</script>""".replace("__ICON__", json.dumps(name)), height=0)
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +219,7 @@ def brand(sub: str = ""):
     st.markdown(f'<div class="brand"><h1>PTCGL 対局検討</h1><span>{E(sub)}</span></div>', unsafe_allow_html=True)
 
 
-register_home_icon()  # ログイン画面でもアイコンが登録されるよう、最初に呼ぶ
+register_home_icon(_ICON_NAME)  # ログイン画面でもアイコンが登録されるよう、最初に呼ぶ
 
 APP_PASSWORD = secret("APP_PASSWORD")
 if APP_PASSWORD and not st.session_state.get("authed"):
